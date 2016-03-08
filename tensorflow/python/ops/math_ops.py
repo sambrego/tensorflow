@@ -25,6 +25,7 @@ operators to your graph.
 @@truediv
 @@floordiv
 @@mod
+@@cross
 
 ## Basic Math Functions
 
@@ -50,8 +51,10 @@ mathematical functions to your graph.
 @@cos
 @@sin
 @@lgamma
+@@digamma
 @@erf
 @@erfc
+@@squared_difference
 
 ## Matrix Math Functions
 
@@ -59,6 +62,7 @@ TensorFlow provides several operations that you can use to add basic
 mathematical functions for matrices to your graph.
 
 @@diag
+@@diag_part
 @@transpose
 
 @@matmul
@@ -169,8 +173,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.python.platform
-
 import numpy as np
 import six.moves
 
@@ -186,7 +188,7 @@ from tensorflow.python.ops import state_ops
 from tensorflow.python.ops import gen_state_ops
 # pylint: disable=wildcard-import,undefined-variable
 from tensorflow.python.ops.gen_math_ops import *
-
+# pylint: enable=wildcard-import
 
 # Aliases for some automatically-generated names.
 argmax = gen_math_ops.arg_max
@@ -255,7 +257,7 @@ def pow(x, y, name=None):
   corresponding elements in `x` and `y`. For example:
 
   ```
-  # tensor 'x' is [[2, 2]], [3, 3]]
+  # tensor 'x' is [[2, 2], [3, 3]]
   # tensor 'y' is [[8, 16], [2, 3]]
   tf.pow(x, y) ==> [[256, 65536], [9, 27]]
   ```
@@ -364,6 +366,35 @@ def cast(x, dtype, name=None):
       if x.dtype.base_dtype == dtype:
         return x
       return gen_math_ops.cast(x, dtype, name=name)
+
+
+def saturate_cast(value, dtype, name=None):
+  """Performs a safe saturating cast of `value` to `dtype`.
+
+  This function casts the input to `dtype` without applying any scaling.  If
+  there is a danger that values would over or underflow in the cast, this op
+  applies the appropriate clamping before the cast.
+
+  Args:
+    value: A `Tensor`.
+    dtype: The desired output `DType`.
+    name: A name for the operation (optional).
+
+  Returns:
+    `value` safely cast to `dtype`.
+  """
+  # When casting to a type with smaller representable range, clamp.
+  # Note that this covers casting to unsigned types as well.
+  with ops.op_scope([value], name, "saturate_cast") as name:
+    value = ops.convert_to_tensor(value, name="value")
+    dtype = dtypes.as_dtype(dtype).base_dtype
+    if value.dtype.min < dtype.min:
+      value = maximum(value, ops.convert_to_tensor(
+          dtype.min, dtype=value.dtype, name="min"))
+    if value.dtype.max > dtype.max:
+      value = minimum(value, ops.convert_to_tensor(
+          dtype.max, dtype=value.dtype, name="max"))
+    return cast(value, dtype, name=name)
 
 
 def to_float(x, name="ToFloat"):
@@ -1052,7 +1083,7 @@ def accumulate_n(inputs, shape=None, tensor_dtype=None, name=None):
   For example:
 
   ```python
-  # tensor 'a' is [[1, 2], [3, 4]
+  # tensor 'a' is [[1, 2], [3, 4]]
   # tensor `b` is [[5, 0], [0, 6]]
   tf.accumulate_n([a, b, a]) ==> [[7, 4], [6, 14]]
 
@@ -1185,6 +1216,23 @@ def lgamma(x, name=None):
     return gen_math_ops._lgamma(x, name=name)
 
 
+def digamma(x, name=None):
+  """Computes Psi, the derivative of lgamma, `ln(|gamma(x)|)`, element-wise.
+
+  Args:
+    x: A Tensor with type `float`, `double`, `int32`, `int64`,
+      or `qint32`.
+    name: A name for the operation (optional).
+
+  Returns:
+    A Tensor with the same type as `x` if `x.dtype != qint32` otherwise
+      the return type is `quint8`.
+  """
+  with ops.op_scope([x], name, "Digamma") as name:
+    x = ops.convert_to_tensor(x, name="x")
+    return gen_math_ops._digamma(x, name=name)
+
+
 def erf(x, name=None):
   """Computes Gauss error function of `x` element-wise.
 
@@ -1223,6 +1271,7 @@ ops.RegisterShape("Abs")(common_shapes.unchanged_shape)
 ops.RegisterShape("Ceil")(common_shapes.unchanged_shape)
 ops.RegisterShape("Conj")(common_shapes.unchanged_shape)
 ops.RegisterShape("Cos")(common_shapes.unchanged_shape)
+ops.RegisterShape("Cross")(common_shapes.unchanged_shape)
 ops.RegisterShape("Exp")(common_shapes.unchanged_shape)
 ops.RegisterShape("Floor")(common_shapes.unchanged_shape)
 ops.RegisterShape("Imag")(common_shapes.unchanged_shape)
@@ -1242,6 +1291,7 @@ ops.RegisterShape("Square")(common_shapes.unchanged_shape)
 ops.RegisterShape("Sigmoid")(common_shapes.unchanged_shape)
 ops.RegisterShape("Tanh")(common_shapes.unchanged_shape)
 ops.RegisterShape("Lgamma")(common_shapes.unchanged_shape)
+ops.RegisterShape("Digamma")(common_shapes.unchanged_shape)
 ops.RegisterShape("Erf")(common_shapes.unchanged_shape)
 ops.RegisterShape("Erfc")(common_shapes.unchanged_shape)
 ops.RegisterShape("Cast")(common_shapes.unchanged_shape)
@@ -1267,6 +1317,7 @@ ops.RegisterShape("IFFT2D")(common_shapes.unchanged_shape)
 @ops.RegisterShape("NotEqual")
 @ops.RegisterShape("Pow")
 @ops.RegisterShape("Sub")
+@ops.RegisterShape("SquaredDifference")
 def _BroadcastShape(op):
   """Common shape function for binary operators that broadcast their inputs."""
   shape_x = op.inputs[0].get_shape()
@@ -1322,10 +1373,27 @@ def _AddNShape(op):
 
 @ops.RegisterShape("Select")
 def _SelectShape(op):
-  # All three inputs must have the same shape.
-  return [op.inputs[0].get_shape()
-          .merge_with(op.inputs[1].get_shape())
-          .merge_with(op.inputs[2].get_shape())]
+  """Shape function for SelectOp."""
+  # The inputs 'then' and 'else' must have the same shape.
+  # The input 'cond' must either have the same shape as 'then' and
+  # 'else', or be a vector if 'then' and 'else' are at least vectors.
+  c_shape = op.inputs[0].get_shape()
+  t_shape = op.inputs[1].get_shape()
+  e_shape = op.inputs[2].get_shape()
+  t_e_shape = t_shape.merge_with(e_shape)
+  c_shape_list = c_shape.as_list() if c_shape.ndims is not None else None
+  t_e_shape_list = t_e_shape.as_list() if t_e_shape.ndims is not None else None
+  if c_shape_list is not None and t_e_shape_list is not None:
+    if len(c_shape_list) != 1:
+      # If the rank of 'cond' is != 1, the shape must match 'then' and 'else'
+      t_e_shape = t_e_shape.merge_with(c_shape)
+    if t_e_shape_list:
+      # If then and else are not scalars, then cond must be at least
+      # a vector, and its first value must match that of 'else'
+      c_shape = c_shape.with_rank_at_least(1)
+      if len(c_shape.as_list()) == 1:
+        c_shape.merge_with(tensor_shape.vector(t_e_shape_list[0]))
+  return [t_e_shape]
 
 
 @ops.RegisterShape("ArgMax")

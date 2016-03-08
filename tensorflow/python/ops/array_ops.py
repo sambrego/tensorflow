@@ -25,6 +25,7 @@ types in your graph.
 @@to_int32
 @@to_int64
 @@cast
+@@saturate_cast
 
 ## Shapes and Shaping
 
@@ -58,6 +59,8 @@ or join multiple tensors together.
 @@gather
 @@dynamic_partition
 @@dynamic_stitch
+@@boolean_mask
+@@one_hot
 
 """
 from __future__ import absolute_import
@@ -65,7 +68,6 @@ from __future__ import division
 from __future__ import print_function
 
 import sys
-import tensorflow.python.platform
 import numpy as np
 
 from tensorflow.python.framework import dtypes
@@ -75,10 +77,12 @@ from tensorflow.python.framework import tensor_util
 from tensorflow.python.ops import common_shapes
 from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.ops import gen_math_ops
-# pylint: disable=wildcard-import
+from tensorflow.python.ops import logging_ops
 # 'Constant' gets imported in the module 'array_ops'.
 from tensorflow.python.ops.constant_op import constant
+# pylint: disable=wildcard-import
 from tensorflow.python.ops.gen_array_ops import *
+# pylint: enable=wildcard-import
 
 
 # We override the 'slice' for the "slice" op, so we keep python's
@@ -88,6 +92,13 @@ _baseslice = slice
 
 # Aliases for some automatically-generated names.
 listdiff = gen_array_ops.list_diff
+
+
+# DEPRECATED use init_ops.zeros_initializer
+# TODO(irving) Move it to init_ops.py
+def zeros_initializer(shape, dtype=dtypes.float32):
+  """An adaptor for zeros() to match the Initializer spec."""
+  return zeros(shape, dtype)
 
 
 # pylint: disable=undefined-variable,protected-access
@@ -365,6 +376,67 @@ def _ConcatOffsetShape(op):
   return [x.get_shape() for x in op.inputs[1:]]
 
 
+def boolean_mask(tensor, mask, name="boolean_mask"):
+  """Apply boolean mask to tensor.  Numpy equivalent is `tensor[mask]`.
+
+  ```python
+  # 1-D example
+  tensor = [0, 1, 2, 3]
+  mask = [True, False, True, False]
+  boolean_mask(tensor, mask) ==> [0, 2]
+  ```
+
+  In general, `0 < dim(mask) = K <= dim(tensor)`, and `mask`'s shape must match
+  the first K dimensions of `tensor`'s shape.  We then have:
+    `boolean_mask(tensor, mask)[i, j1,...,jd] = tensor[i1,...,iK,j1,...,jd]`
+  where `(i1,...,iK)` is the ith `True` entry of `mask` (row-major order).
+
+  Args:
+    tensor:  N-D tensor.  First K dimensions can be None, which allows e.g.
+      undefined batch size.  Trailing dimensions must be specified.
+    mask:  K-D boolean tensor, K <= N.
+    name:  A name for this operation (optional).
+
+  Returns:
+    Tensor populated by entries in `tensor` corresponding to `True` values in
+      `mask`.
+
+  Raises:
+    ValueError:  If shapes do not conform.
+
+  Examples:
+  ```python
+  # 2-D example
+  a = [[1, 2], [3, 4], [5, 6]]
+  mask = [True, False, True]
+  boolean_mask(tensor, mask) ==> [[1, 2], [5, 6]]
+  ```
+  """
+  def _apply_mask_1d(reshaped_tensor, mask):
+    """Mask tensor along dimension 0 with a 1-D mask."""
+    indices = squeeze(where(mask), squeeze_dims=[1])
+    return gather(reshaped_tensor, indices)
+
+  with ops.op_scope([tensor, mask], name):
+    tensor = ops.convert_to_tensor(tensor, name="tensor")
+    mask = ops.convert_to_tensor(mask, name="mask")
+
+    shape_mask = mask.get_shape()
+    ndims_mask = shape_mask.ndims
+    shape_tensor = tensor.get_shape()
+    if ndims_mask == 0:
+      raise ValueError("mask cannot be scalar.")
+    if ndims_mask is None:
+      raise ValueError(
+          "mask dimensions must be specified, even if some dimensions are None"
+          ".  E.g. shape=[None] is ok, but shape=None is not.")
+    shape_tensor[:ndims_mask].assert_is_compatible_with(shape_mask)
+
+    tensor = reshape(tensor, [-1] + shape_tensor.as_list()[ndims_mask:])
+    mask = reshape(mask, [-1])
+    return _apply_mask_1d(tensor, mask)
+
+
 def sparse_mask(a, mask_indices, name=None):
   """Masks elements of `IndexedSlices`.
 
@@ -496,8 +568,8 @@ def transpose(a, perm=None, name="transpose"):
   """
   with ops.op_scope([a], name, "transpose") as name:
     if perm is None:
-      dims = gen_math_ops._range(0, gen_array_ops.rank(a), 1)
-      perm = gen_array_ops.reverse(dims, [True])
+      rank = gen_array_ops.rank(a)
+      perm = (rank - 1) - gen_math_ops._range(0, rank, 1)
       ret = gen_array_ops.transpose(a, perm, name=name)
       # NOTE(mrry): Setting the shape explicitly because
       #   reverse is not handled by the shape function.
@@ -564,11 +636,9 @@ def zeros_like(tensor, dtype=None, name=None):
   """
   with ops.op_scope([tensor], name, "zeros_like") as name:
     tensor = ops.convert_to_tensor(tensor, name="tensor")
-    zeros_shape = shape(tensor)
-    if dtype is None:
-      dtype = tensor.dtype
-    ret = zeros(zeros_shape, dtype=dtype, name=name)
-    ret.set_shape(tensor.get_shape())
+    ret = gen_array_ops._zeros_like(tensor)
+    if (dtype is not None) and (tensor.dtype != dtype):
+      ret = gen_math_ops.cast(ret, dtype)
     return ret
 
 
@@ -603,11 +673,6 @@ def ones_like(tensor, dtype=None, name=None):
     ret = ones(ones_shape, dtype=dtype, name=name)
     ret.set_shape(tensor.get_shape())
     return ret
-
-
-def zeros_initializer(shape, dtype=dtypes.float32):
-  """An adaptor for zeros() to match the Initializer spec."""
-  return zeros(shape, dtype)
 
 
 def ones(shape, dtype=dtypes.float32, name=None):
@@ -779,6 +844,35 @@ def _DiagShape(op):
   input_shape = op.inputs[0].get_shape().with_rank_at_most(3)
   return [input_shape.concatenate(input_shape)]
 
+@ops.RegisterShape("DiagPart")
+def _DiagPartShape(op):
+  """Shape function for array_ops.diag_part.
+
+  This op has one input (of rank k = 2, 4, or 6), and one output (of rank k/2),
+  where the shape of the output is the diagonal of the input shape.
+
+  Args:
+    op: A DiagPart Operation.
+
+  Returns:
+    A single-element list containing the shape of the output.
+
+  Raises:
+    ValueError: If input has odd rank or greater than 6
+
+  """
+  shape = op.inputs[0].get_shape()
+  rank = len(shape)
+  mid = rank // 2
+  if rank % 2 or rank > 6:
+    raise ValueError("Input must have even rank <= 6, input rank is " +
+                     str(rank) + "." )
+  if shape[:mid] != shape[mid:]:
+    raise ValueError("Invalid shape, shape[:mid] " + str(shape[:mid]) +
+                     " and shape[mid:] " + str(shape[mid:]) +
+                     " do not match ")
+  input_shape = shape.with_rank_at_most(6)
+  return [input_shape[:len(input_shape) // 2]]
 
 @ops.RegisterShape("ExpandDims")
 def _ExpandDimsShape(op):
@@ -842,18 +936,48 @@ def _SqueezeShape(op):
   result_shape = []
   for i, dim in enumerate([d.value for d in input_shape.dims]):
     is_explicit_match = i in wrapped_squeeze_dims
-    if is_explicit_match or not wrapped_squeeze_dims:
-      if dim is None:
+    if dim is None:
+      if is_explicit_match:
+        # Assume that the squeezed dimension will be 1 at runtime.
+        continue
+      if not wrapped_squeeze_dims:
+        # If squeezing all 1 dimensions and we see a None, give up.
         return [tensor_shape.unknown_shape()]
-      if dim != 1:
-        if is_explicit_match:
-          raise ValueError(
-              "Can not squeeze dim[%d], expected a dimension of 1, got %d." % (
-                  i, dim))
-        result_shape.append(dim)
-    else:
-      result_shape.append(dim)
+    elif dim == 1:
+      if is_explicit_match or not wrapped_squeeze_dims:
+        continue
+    elif is_explicit_match:
+      raise ValueError(
+          "Can not squeeze dim[%d], expected a dimension of 1, got %d." % (
+              i, dim))
+    result_shape.append(dim)
   return [tensor_shape.TensorShape(result_shape)]
+
+
+@ops.RegisterShape("Bitcast")
+def _BitcastShape(op):
+  """Shape function for Bitcast op."""
+  input_shape = op.inputs[0].get_shape()
+  input_type = op.inputs[0].dtype
+  size_of_input = input_type.size
+  output = dtypes.as_dtype(op.get_attr("type"))
+  size_of_output = output.size
+  if size_of_input == size_of_output:
+    return [tensor_shape.TensorShape(input_shape)]
+  else:
+    if size_of_output > size_of_input:
+      new_shape = input_shape.as_list()
+      last_val = new_shape[-1]
+      if last_val == (size_of_output // size_of_input):
+        new_shape = new_shape[:-1]
+      else:
+        raise ValueError(
+            "Cannot bitcast due to shape. %d is not evenly divisible by %d." %
+            (new_shape[-1], size_of_input // size_of_output))
+    else:
+      new_shape = input_shape
+      new_shape = new_shape.concatenate([size_of_input // size_of_output])
+    return [tensor_shape.TensorShape(new_shape)]
 
 
 @ops.RegisterShape("Reshape")
@@ -1263,7 +1387,7 @@ def _SpaceToDepthShape(op):
   * input: a tensor of shape like that [B, H, W, D]
   * block_size: an int.
 
-  Its output is the the same-rank tensor but with changed
+  Its output is the same-rank tensor but with changed
   dimensions like that: [B, H/block_size, W/block_size, D*block_size*block_size]
 
   Args:
@@ -1311,7 +1435,7 @@ def _DepthToSpaceShape(op):
   * input: a tensor of shape like that [B, H, W, D]
   * block_size: an int.
 
-  Its output is the the same-rank tensor but with changed
+  Its output is the same-rank tensor but with changed
   dimensions like that:
       [B, H*block_size, W*block_size, D/(block_size*block_size)]
 
@@ -1350,3 +1474,34 @@ def _DepthToSpaceShape(op):
   new_depth = input_depth // (block_size * block_size)
   return [tensor_shape.TensorShape(
       [input_shape[0], height, width, new_depth])]
+
+
+@ops.RegisterShape("OneHot")
+def _OneHotShape(op):
+  """Shape function for the OneHot op.
+
+  It closely follows the code in the .cc implementation.
+
+  Args:
+    op: A OneHot Operation.
+
+  Returns:
+    A single-element list containing the shape of the output.
+
+  Raises:
+    ValueError: if axis < -1.
+  """
+  indices_shape = op.inputs[0].get_shape()
+  indices_dims = indices_shape.ndims
+  depth = tensor_util.constant_value(op.inputs[1])
+  axis = op.get_attr("axis")
+
+  if axis < -1:
+    raise ValueError("axis must be >= -1")
+
+  new_shape = None
+  if indices_dims is not None:
+    new_shape = indices_shape.as_list()
+    new_shape.insert(axis % (indices_dims + 1), depth)
+
+  return [tensor_shape.TensorShape(new_shape)]

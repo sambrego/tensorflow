@@ -18,21 +18,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-# pylint: disable=g-bad-import-order
-
-# pylint: disable=unused-import
-import tensorflow.python.platform
-# pylint: enable=unused_import
-
-import numpy as np
-import tensorflow as tf
 import sys
 import time
 
-from tensorflow.python.client import graph_util
-from tensorflow.python.ops import sparse_ops
+import numpy as np
+import tensorflow as tf
 
-# pylint: enable=g-bad-import-order
+from tensorflow.python.ops import sparse_ops
 
 
 class SparseXentTest(tf.test.TestCase):
@@ -212,7 +204,7 @@ def sparse_vs_dense_xent_benchmark(batch_size, num_entries, use_gpu):
   # Using sparse_to_dense and softmax_cross_entropy_with_logits
   with tf.Session(config=config) as sess:
     if not use_gpu:
-      with tf.device(graph_util.pin_to_cpu):
+      with tf.device("/cpu:0"):
         ops = _sparse_vs_dense_xent_benchmark_dense(labels, logits)
     else:
       ops = _sparse_vs_dense_xent_benchmark_dense(labels, logits)
@@ -221,7 +213,7 @@ def sparse_vs_dense_xent_benchmark(batch_size, num_entries, use_gpu):
   # Using sparse_softmax_cross_entropy_with_logits
   with tf.Session(config=config) as sess:
     if not use_gpu:
-      with tf.device(graph_util.pin_to_cpu):
+      with tf.device("/cpu:0"):
         ops = _sparse_vs_dense_xent_benchmark_sparse(labels, logits)
     else:
       ops = _sparse_vs_dense_xent_benchmark_sparse(labels, logits)

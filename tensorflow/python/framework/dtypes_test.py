@@ -18,8 +18,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.python.platform
-
 import numpy as np
 import tensorflow as tf
 
@@ -78,6 +76,12 @@ class TypesTest(test_util.TensorFlowTestCase):
     self.assertIs(tf.bool, tf.as_dtype(np.bool))
     with self.assertRaises(TypeError):
       tf.as_dtype(np.dtype([("f1", np.uint), ("f2", np.int32)]))
+
+  def testRealDtype(self):
+    for dtype in [tf.float32, tf.float64, tf.bool, tf.uint8, tf.int8, tf.int16,
+                  tf.int32, tf.int64]:
+      self.assertIs(dtype.real_dtype, dtype)
+    self.assertIs(tf.complex64.real_dtype, tf.float32)
 
   def testStringConversion(self):
     self.assertIs(tf.float32, tf.as_dtype("float32"))
@@ -148,6 +152,19 @@ class TypesTest(test_util.TensorFlowTestCase):
     self.assertEqual(tf.as_dtype("float64").is_floating, True)
     self.assertEqual(tf.as_dtype("string").is_floating, False)
     self.assertEqual(tf.as_dtype("bool").is_floating, False)
+
+  def testIsComplex(self):
+    self.assertEqual(tf.as_dtype("int8").is_complex, False)
+    self.assertEqual(tf.as_dtype("int16").is_complex, False)
+    self.assertEqual(tf.as_dtype("int32").is_complex, False)
+    self.assertEqual(tf.as_dtype("int64").is_complex, False)
+    self.assertEqual(tf.as_dtype("uint8").is_complex, False)
+    self.assertEqual(tf.as_dtype("uint16").is_complex, False)
+    self.assertEqual(tf.as_dtype("complex64").is_complex, True)
+    self.assertEqual(tf.as_dtype("float32").is_complex, False)
+    self.assertEqual(tf.as_dtype("float64").is_complex, False)
+    self.assertEqual(tf.as_dtype("string").is_complex, False)
+    self.assertEqual(tf.as_dtype("bool").is_complex, False)
 
   def testIsUnsigned(self):
     self.assertEqual(tf.as_dtype("int8").is_unsigned, False)

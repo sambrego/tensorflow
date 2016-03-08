@@ -31,12 +31,11 @@ py_test(
     name = "freeze_graph_test",
     size = "small",
     srcs = [
-        "freeze_graph.py",
         "freeze_graph_test.py",
     ],
     srcs_version = "PY2AND3",
     deps = [
-        "//tensorflow:tensorflow_py",
+        ":freeze_graph",
         "//tensorflow/python:framework_test_lib",
         "//tensorflow/python:platform_test",
     ],
@@ -56,9 +55,24 @@ py_binary(
     srcs = [
         "graph_metrics.py",
     ],
+    srcs_version = "PY2AND3",
     main = "graph_metrics.py",
     deps = [
         "//tensorflow:tensorflow_py",
+    ],
+)
+
+py_test(
+    name = "graph_metrics_test",
+    size = "small",
+    srcs = [
+        "graph_metrics_test.py",
+    ],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":graph_metrics_lib",
+        "//tensorflow/python:framework_test_lib",
+        "//tensorflow/python:platform_test",
     ],
 )
 

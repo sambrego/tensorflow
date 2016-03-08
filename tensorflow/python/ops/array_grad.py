@@ -169,10 +169,13 @@ def _FillGrad(_, grad):
   return None, math_ops.reduce_sum(grad)
 
 
+ops.NoGradient("ZerosLike")
+
+
 @ops.RegisterGradient("Gather")
 def _GatherGrad(op, grad):
   # op.inputs[0] can be large, so colocate the shape calculation with it.
-  with ops.device(op.inputs[0].device):
+  with ops.colocate_with(op.inputs[0]):
     dense_shape = array_ops.shape(op.inputs[0])
     values_shape = array_ops.concat(0, [[-1], dense_shape[1:]])
 
@@ -309,3 +312,6 @@ def _DepthToSpaceGrad(op, grad):
   # Its gradient is the opposite op: SpaceToDepth.
   block_size = op.get_attr("block_size")
   return array_ops.space_to_depth(grad, block_size)
+
+
+ops.NoGradient("OneHot")
